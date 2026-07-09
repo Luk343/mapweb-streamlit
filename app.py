@@ -30,10 +30,21 @@ DATA = Path("data")
 # PASO 1: Paletas cartográficas
 # ─────────────────────────────────────────────────────────────
 
-PALETA_USO_SUELO = [
-    "#E8A33D", "#4C9A4C", "#8FBF6A", "#2E7D32", "#5CC8C8",
-    "#B0B0B0", "#3F7FBF", "#C97A4A", "#D9C36A", "#7A5C3E",
-]
+COLOR_POR_ID_USO = {
+    "01": "#E31A1C",  # Urbano
+    "02": "#FF7F00",  # Agrícola
+    "03": "#A6D854",  # Pradera o matorral
+    "04": "#1A9850",  # Bosque
+    "05": "#40E0D0",  # Humedal
+    "06": "#A0A0A0",  # Sin vegetación
+    "08": "#3182BD",  # Cuerpos de agua
+}
+COLOR_USO_DEFAULT = "#FF00FF"  # "todos los otros valores", igual que en QGIS
+
+LABEL_POR_ID_USO = {
+    "01": "Urbano", "02": "Agrícola", "03": "Pradera o matorral",
+    "04": "Bosque", "05": "Humedal", "06": "Sin vegetación", "08": "Cuerpos de agua",
+}
 
 ESTILOS_VIAL = {
     "nacional":     {"color": "#CC0000", "weight": 5},
@@ -73,10 +84,10 @@ def construir_mapa_colores(serie, paleta):
     return {str(v): paleta[i % len(paleta)] for i, v in enumerate(valores)}
 
 
-def crear_style_uso_suelo(color_map):
+def crear_style_uso_suelo():
     def style_fn(feature):
-        val = str(feature["properties"].get("USO", ""))
-        color = color_map.get(val, "#AAAAAA")
+        id_uso = str(feature["properties"].get("ID_USO", "")).zfill(2)
+        color = COLOR_POR_ID_USO.get(id_uso, COLOR_USO_DEFAULT)
         return {"fillColor": color, "color": "#444444", "weight": 0.4, "fillOpacity": 0.65}
     return style_fn
 
@@ -226,8 +237,43 @@ def load_vectors():
     return manzanas, uso, vial
 
 
+@st.cache_data
+def calcular_distancia_a_verde(_manzanas, _uso):
+    """Distancia (m) de cada manzana al polígono de bosque/humedal más cercano,
+    usando sjoin_nearest (índice espacial) en vez de unary_union, que es
+    demasiado costoso en memoria/tiempo para una capa con miles de polígonos."""
+    manzanas_utm = _manzanas.to_crs(32718)
+    uso_utm = _uso.to_crs(32718)
+    verde = uso_utm[uso_utm["ID_USO"].astype(str).str.zfill(2).isin(["04", "05"])].copy()
+    if verde.empty:
+        return np.zeros(len(manzanas_utm))
+
+    centroides = gpd.GeoDataFrame(
+        geometry=manzanas_utm.geometry.centroid, crs=manzanas_utm.crs
+    )
+    verde["geometry"] = verde.geometry.buffer(0)  # repara geometrías inválidas
+
+    cercano = gpd.sjoin_nearest(
+        centroides, verde[["geometry"]], distance_col="dist_verde_m"
+    )
+    cercano = cercano[~cercano.index.duplicated(keep="first")]
+    return cercano["dist_verde_m"].reindex(centroides.index).fillna(0).values
+
+
 manzanas, uso, vial = load_vectors()
-color_map_uso = construir_mapa_colores(uso["USO"], PALETA_USO_SUELO)
+manzanas["dist_verde_m"] = calcular_distancia_a_verde(manzanas, uso)
+uso["ID_USO"] = uso["ID_USO"].astype(str).str.zfill(2)
+
+ids_presentes = sorted(uso["ID_USO"].dropna().unique())
+color_map_uso = {
+    LABEL_POR_ID_USO.get(i, "Otros"): COLOR_POR_ID_USO.get(i, COLOR_USO_DEFAULT)
+    for i in ids_presentes
+}
+# nombre real de USO -> color, para el gráfico de barras
+color_por_nombre_uso = {
+    row["USO"]: COLOR_POR_ID_USO.get(row["ID_USO"], COLOR_USO_DEFAULT)
+    for _, row in uso[["USO", "ID_USO"]].drop_duplicates().iterrows()
+}
 
 # ─────────────────────────────────────────────────────────────
 # Sidebar
@@ -268,7 +314,9 @@ else:
 # Mapa base
 # ─────────────────────────────────────────────────────────────
 
-centro = [manzanas.geometry.centroid.y.mean(), manzanas.geometry.centroid.x.mean()]
+centro_utm = manzanas.to_crs(32718).geometry.centroid
+centro_gdf = gpd.GeoSeries(centro_utm, crs=32718).to_crs(4326)
+centro = [centro_gdf.y.mean(), centro_gdf.x.mean()]
 m = folium.Map(location=centro, zoom_start=12, tiles="OpenStreetMap")
 folium.TileLayer("CartoDB positron", name="Mapa claro").add_to(m)
 folium.TileLayer("CartoDB dark_matter", name="Mapa oscuro").add_to(m)
@@ -302,7 +350,7 @@ if show_dem:
 if show_uso:
     folium.GeoJson(
         uso, name="🌳 Uso de suelo (CONAF)",
-        style_function=crear_style_uso_suelo(color_map_uso),
+        style_function=crear_style_uso_suelo(),
         tooltip=folium.GeoJsonTooltip(fields=["USO", "SUBUSO", "SUPERF_HA"],
                                        aliases=["Uso:", "Subuso:", "Superficie (ha):"]),
     ).add_to(m)
@@ -334,8 +382,8 @@ if show_manzanas and len(manzanas_filtradas):
             manzanas_filtradas["n_per"].min(), manzanas_filtradas["n_per"].max()
         ),
         tooltip=folium.GeoJsonTooltip(
-            fields=["COMUNA", "n_per", "n_hog", "prom_per_hog"],
-            aliases=["Comuna:", "Población:", "N° hogares:", "Prom. per./hogar:"],
+            fields=["COMUNA", "n_per", "n_hog", "prom_per_hog", "dist_verde_m"],
+            aliases=["Comuna:", "Población:", "N° hogares:", "Prom. per./hogar:", "Dist. a área verde (m):"],
         ),
     ).add_to(m)
     leyendas_html.append(leyenda_graduada_html(
@@ -365,9 +413,37 @@ st.subheader("Superficie por categoría de uso de suelo")
 area_por_uso = (uso.groupby("USO")["SUPERF_HA"].sum().reset_index()
                  .sort_values("SUPERF_HA", ascending=False))
 fig = px.bar(area_por_uso, x="USO", y="SUPERF_HA", color="USO",
-             color_discrete_map=color_map_uso,
+             color_discrete_map=color_por_nombre_uso,
              labels={"SUPERF_HA": "Superficie (ha)", "USO": "Uso de suelo"})
 st.plotly_chart(fig, use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────
+# Análisis territorial: población vs. cercanía a área verde
+# ─────────────────────────────────────────────────────────────
+
+st.subheader("¿La población se concentra lejos de las áreas verdes?")
+st.caption(
+    "Cada punto es una manzana censal: población total vs. distancia al bosque o "
+    "humedal más cercano. Si hay tendencia positiva, la urbanización más densa "
+    "ocurre justamente donde ya no queda cobertura vegetal cerca."
+)
+
+datos_corr = manzanas_filtradas[manzanas_filtradas["n_per"] > 0]
+if len(datos_corr) > 5:
+    corr = np.corrcoef(datos_corr["dist_verde_m"], datos_corr["n_per"])[0, 1]
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.metric("Correlación", f"{corr:.2f}")
+        st.caption("Cercano a 1: más lejos de zonas verdes = más población.\nCercano a 0: sin relación clara.")
+    with col2:
+        fig_corr = px.scatter(
+            datos_corr, x="dist_verde_m", y="n_per",
+            labels={"dist_verde_m": "Distancia a bosque/humedal (m)", "n_per": "Población de la manzana"},
+            opacity=0.6,
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
+else:
+    st.info("Ajusta el filtro de población para incluir más manzanas y ver esta relación.")
 
 # ─────────────────────────────────────────────────────────────
 # Tabla de atributos
