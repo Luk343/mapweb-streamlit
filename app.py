@@ -75,6 +75,35 @@ COLORMAP_DEM = [
     (1.00, "#FFFAFA"),
 ]
 
+# NDVI absoluto (2020 / 2026): rojo (sin vegetación) -> verde (vegetación densa)
+COLORMAP_NDVI = [
+    (0.00, "#a50026"),
+    (0.20, "#f46d43"),
+    (0.40, "#fee08b"),
+    (0.55, "#d9ef8b"),
+    (0.70, "#66bd63"),
+    (1.00, "#006837"),
+]
+
+# Diferencia NDVI (2026 - 2020): rojo = pérdida de vegetación, verde = ganancia
+COLORMAP_NDVI_DIFF = [
+    (0.00, "#8B0000"),
+    (0.17, "#d73027"),
+    (0.34, "#fee08b"),
+    (0.50, "#ffffff"),
+    (0.66, "#a6d96a"),
+    (0.83, "#1a9850"),
+    (1.00, "#006400"),
+]
+
+# Temperatura superficial (LST): azul (frío) -> rojo (cálido)
+COLORMAP_LST = [
+    (0.00, "#2166ac"),
+    (0.33, "#67a9cf"),
+    (0.66, "#fdae61"),
+    (1.00, "#d73027"),
+]
+
 # ─────────────────────────────────────────────────────────────
 # PASO 2: Funciones de color / estilo
 # ─────────────────────────────────────────────────────────────
@@ -158,11 +187,11 @@ def leyenda_graduada_html(titulo, colormap_stops, val_min, val_max, unidad="", i
                     border:1px solid #888;border-radius:3px;flex-shrink:0;"></div>
         <div style="display:flex;flex-direction:column;justify-content:space-between;
                     font-size:11px;color:#333;">
-          <span><b>{int(val_max)}{unidad}</b></span>
-          <span>{int(val_min + (val_max - val_min) * 0.75)}{unidad}</span>
-          <span>{int(val_min + (val_max - val_min) * 0.50)}{unidad}</span>
-          <span>{int(val_min + (val_max - val_min) * 0.25)}{unidad}</span>
-          <span><b>{int(val_min)}{unidad}</b></span>
+          <span><b>{val_max:.2f}{unidad}</b></span>
+          <span>{(val_min + (val_max - val_min) * 0.75):.2f}{unidad}</span>
+          <span>{(val_min + (val_max - val_min) * 0.50):.2f}{unidad}</span>
+          <span>{(val_min + (val_max - val_min) * 0.25):.2f}{unidad}</span>
+          <span><b>{val_min:.2f}{unidad}</b></span>
         </div>
       </div>
     </div>"""
@@ -222,6 +251,79 @@ def raster_a_overlay(raster_path):
         bounds = [[bounds_wgs84[1], bounds_wgs84[0]], [bounds_wgs84[3], bounds_wgs84[2]]]
         return img_b64, bounds, dem_min, dem_max
 
+
+# ─────────────────────────────────────────────────────────────
+# PASO 4b: Overlay genérico para capas continuas (NDVI, NDVI_diff, LST)
+# Reutiliza el mismo patrón de reproyección que raster_a_overlay, pero
+# permite pasar cualquier paleta y usa recorte por percentiles 2-98 para
+# fijar el rango de color (evita que píxeles-basura de borde/nube
+# aplasten la escala, algo que sí pasa si se usa min/max crudo).
+# ─────────────────────────────────────────────────────────────
+
+def aplicar_colormap_continuo(band, paleta_stops, vmin, vmax):
+    posiciones = [p for p, _ in paleta_stops]
+    colores = [c for _, c in paleta_stops]
+    cmap = mcolors.LinearSegmentedColormap.from_list("continuo", list(zip(posiciones, colores)))
+
+    mascara = np.isnan(band)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    rgba = cmap(norm(np.nan_to_num(band, nan=vmin)))
+    rgba[mascara, 3] = 0
+    rgba[~mascara, 3] = 0.80
+    return (rgba * 255).astype(np.uint8)
+
+
+@st.cache_data
+def raster_a_overlay_continuo(raster_path, _paleta_stops, simetrico=False):
+    """_paleta_stops lleva guión bajo para que st.cache_data no intente
+    hashear la lista de tuplas (los objetos no-hasheables se ignoran del hash
+    cuando el nombre del parámetro empieza con _)."""
+    with rasterio.open(raster_path) as src:
+        if src.crs and src.crs.to_epsg() != 4326:
+            transform, width, height = calculate_default_transform(
+                src.crs, "EPSG:4326", src.width, src.height, *src.bounds
+            )
+            data = np.full((height, width), np.nan, dtype=np.float32)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=data,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs="EPSG:4326",
+                resampling=Resampling.bilinear,
+                src_nodata=src.nodata,
+                dst_nodata=np.nan,
+            )
+            bounds_wgs84 = rasterio.transform.array_bounds(height, width, transform)
+        else:
+            data = src.read(1, out_dtype="float32")
+            bounds_wgs84 = src.bounds
+
+        if src.nodata is not None:
+            data = np.where(data == src.nodata, np.nan, data)
+
+        valid = data[~np.isnan(data)]
+        if len(valid) == 0:
+            v_lo, v_hi = 0.0, 1.0
+        else:
+            v_lo, v_hi = np.nanpercentile(valid, [2, 98])
+
+        if simetrico:
+            v_abs = max(abs(v_lo), abs(v_hi))
+            v_lo, v_hi = -v_abs, v_abs
+
+        img_array = aplicar_colormap_continuo(data, _paleta_stops, v_lo, v_hi)
+
+        img_pil = Image.fromarray(img_array)
+        buf = io.BytesIO()
+        img_pil.save(buf, format="PNG")
+        buf.seek(0)
+        img_b64 = base64.b64encode(buf.read()).decode("utf-8")
+
+        bounds = [[bounds_wgs84[1], bounds_wgs84[0]], [bounds_wgs84[3], bounds_wgs84[2]]]
+        return img_b64, bounds, float(v_lo), float(v_hi)
+
 # ─────────────────────────────────────────────────────────────
 # Cargar datos
 # ─────────────────────────────────────────────────────────────
@@ -234,6 +336,23 @@ def load_vectors():
     manzanas["n_per"] = pd.to_numeric(manzanas["n_per"], errors="coerce").fillna(0)
     uso["SUPERF_HA"] = pd.to_numeric(uso["SUPERF_HA"], errors="coerce").fillna(0)
     vial["shape_leng"] = pd.to_numeric(vial["shape_leng"], errors="coerce").fillna(0)
+
+    # ── Zonal stats calculadas en GEE (NDVI_diff y LST promedio por manzana) ──
+    # Se unen por MANZENT en vez de recalcular esto localmente: hacerlo con
+    # rasterstats sobre 2169 polígonos x 4 rasters en Streamlit Cloud es
+    # justo el tipo de operación pesada que ya causó el crash del unary_union.
+    stats_ndvi = pd.read_csv(DATA / "manzanas_ndvi_diff_stats.csv")
+    stats_ndvi = stats_ndvi.rename(columns={"mean": "ndvi_diff_mean"})
+    stats_lst = pd.read_csv(DATA / "manzanas_lst_stats.csv")
+    stats_lst = stats_lst.rename(columns={"mean": "lst_mean"})
+
+    manzanas["MANZENT"] = manzanas["MANZENT"].astype(str)
+    stats_ndvi["MANZENT"] = stats_ndvi["MANZENT"].astype(str)
+    stats_lst["MANZENT"] = stats_lst["MANZENT"].astype(str)
+
+    manzanas = manzanas.merge(stats_ndvi[["MANZENT", "ndvi_diff_mean"]], on="MANZENT", how="left")
+    manzanas = manzanas.merge(stats_lst[["MANZENT", "lst_mean"]], on="MANZENT", how="left")
+
     return manzanas, uso, vial
 
 
@@ -287,7 +406,11 @@ show_uso = st.sidebar.checkbox("Uso de suelo (CONAF)", value=True)
 show_vial = st.sidebar.checkbox("Red vial (MOP)", value=False)
 
 st.sidebar.subheader("🛰️ Raster")
-show_dem = st.sidebar.checkbox("DEM (elevación)", value=False)
+show_dem = st.sidebar.checkbox("DEM (elevación, SRTM 30m)", value=False)
+show_ndvi_2020 = st.sidebar.checkbox("NDVI 2020", value=False)
+show_ndvi_2026 = st.sidebar.checkbox("NDVI 2026", value=False)
+show_ndvi_diff = st.sidebar.checkbox("Diferencia NDVI (2020→2026)", value=False)
+show_lst = st.sidebar.checkbox("Temperatura superficial (LST, Landsat)", value=False)
 
 st.sidebar.subheader("🔍 Filtro")
 pob_min, pob_max = int(manzanas["n_per"].min()), int(manzanas["n_per"].max())
@@ -344,6 +467,72 @@ if show_dem:
         st.warning(f"No fue posible cargar el DEM: {e}")
 
 # ─────────────────────────────────────────────────────────────
+# Raster NDVI 2020 / 2026 / Diferencia / LST
+# ─────────────────────────────────────────────────────────────
+
+if show_ndvi_2020:
+    try:
+        with st.spinner("Cargando NDVI 2020..."):
+            img_b64, bounds, v_lo, v_hi = raster_a_overlay_continuo(DATA / "NDVI_2020.tif", COLORMAP_NDVI)
+        folium.raster_layers.ImageOverlay(
+            image=f"data:image/png;base64,{img_b64}",
+            bounds=bounds, opacity=0.80, name="🌱 NDVI 2020",
+        ).add_to(m)
+        leyendas_html.append(leyenda_graduada_html(
+            "NDVI 2020", COLORMAP_NDVI, v_lo, v_hi, icono="🌱", top=f"{offset_top}px"
+        ))
+        offset_top += 220
+    except Exception as e:
+        st.warning(f"No fue posible cargar NDVI 2020: {e}")
+
+if show_ndvi_2026:
+    try:
+        with st.spinner("Cargando NDVI 2026..."):
+            img_b64, bounds, v_lo, v_hi = raster_a_overlay_continuo(DATA / "NDVI_2026.tif", COLORMAP_NDVI)
+        folium.raster_layers.ImageOverlay(
+            image=f"data:image/png;base64,{img_b64}",
+            bounds=bounds, opacity=0.80, name="🌱 NDVI 2026",
+        ).add_to(m)
+        leyendas_html.append(leyenda_graduada_html(
+            "NDVI 2026", COLORMAP_NDVI, v_lo, v_hi, icono="🌱", top=f"{offset_top}px"
+        ))
+        offset_top += 220
+    except Exception as e:
+        st.warning(f"No fue posible cargar NDVI 2026: {e}")
+
+if show_ndvi_diff:
+    try:
+        with st.spinner("Cargando diferencia NDVI..."):
+            img_b64, bounds, v_lo, v_hi = raster_a_overlay_continuo(
+                DATA / "NDVI_diff_2020_2026.tif", COLORMAP_NDVI_DIFF, simetrico=True
+            )
+        folium.raster_layers.ImageOverlay(
+            image=f"data:image/png;base64,{img_b64}",
+            bounds=bounds, opacity=0.80, name="🔥 Diferencia NDVI (2020→2026)",
+        ).add_to(m)
+        leyendas_html.append(leyenda_graduada_html(
+            "Δ NDVI 2020→2026", COLORMAP_NDVI_DIFF, v_lo, v_hi, icono="🔥", top=f"{offset_top}px"
+        ))
+        offset_top += 220
+    except Exception as e:
+        st.warning(f"No fue posible cargar la diferencia NDVI: {e}")
+
+if show_lst:
+    try:
+        with st.spinner("Cargando temperatura superficial..."):
+            img_b64, bounds, v_lo, v_hi = raster_a_overlay_continuo(DATA / "LST_Valdivia_Landsat.tif", COLORMAP_LST)
+        folium.raster_layers.ImageOverlay(
+            image=f"data:image/png;base64,{img_b64}",
+            bounds=bounds, opacity=0.80, name="🌡️ Temperatura superficial (LST)",
+        ).add_to(m)
+        leyendas_html.append(leyenda_graduada_html(
+            "LST (°C)", COLORMAP_LST, v_lo, v_hi, unidad=" °C", icono="🌡️", top=f"{offset_top}px"
+        ))
+        offset_top += 220
+    except Exception as e:
+        st.warning(f"No fue posible cargar LST: {e}")
+
+# ─────────────────────────────────────────────────────────────
 # Uso de suelo (categórico)
 # ─────────────────────────────────────────────────────────────
 
@@ -382,8 +571,9 @@ if show_manzanas and len(manzanas_filtradas):
             manzanas_filtradas["n_per"].min(), manzanas_filtradas["n_per"].max()
         ),
         tooltip=folium.GeoJsonTooltip(
-            fields=["COMUNA", "n_per", "n_hog", "prom_per_hog", "dist_verde_m"],
-            aliases=["Comuna:", "Población:", "N° hogares:", "Prom. per./hogar:", "Dist. a área verde (m):"],
+            fields=["COMUNA", "n_per", "n_hog", "prom_per_hog", "dist_verde_m", "ndvi_diff_mean", "lst_mean"],
+            aliases=["Comuna:", "Población:", "N° hogares:", "Prom. per./hogar:",
+                     "Dist. a área verde (m):", "Δ NDVI 2020→2026:", "Temp. superficial (°C):"],
         ),
     ).add_to(m)
     leyendas_html.append(leyenda_graduada_html(
@@ -446,14 +636,93 @@ else:
     st.info("Ajusta el filtro de población para incluir más manzanas y ver esta relación.")
 
 # ─────────────────────────────────────────────────────────────
+# Análisis territorial: temperatura superficial vs. cercanía a área verde
+# ─────────────────────────────────────────────────────────────
+
+st.subheader("¿Las manzanas más lejos de áreas verdes están más calientes?")
+st.caption(
+    "Temperatura superficial promedio (LST, Landsat 8/9, 30m) por manzana vs. "
+    "distancia al bosque o humedal más cercano. Respalda o descarta el efecto "
+    "de isla de calor urbana asociado a la pérdida de cobertura vegetal."
+)
+
+datos_lst = manzanas_filtradas.dropna(subset=["lst_mean"])
+if len(datos_lst) > 5:
+    corr_lst = np.corrcoef(datos_lst["dist_verde_m"], datos_lst["lst_mean"])[0, 1]
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.metric("Correlación", f"{corr_lst:.2f}")
+        st.caption("Negativo: más lejos de zonas verdes = más frío (poco esperable).\nPositivo: más lejos = más calor (isla de calor).")
+    with col2:
+        fig_lst = px.scatter(
+            datos_lst, x="dist_verde_m", y="lst_mean",
+            labels={"dist_verde_m": "Distancia a bosque/humedal (m)", "lst_mean": "Temperatura superficial promedio (°C)"},
+            opacity=0.6, color="n_per",
+            color_continuous_scale="YlOrRd",
+        )
+        st.plotly_chart(fig_lst, use_container_width=True)
+else:
+    st.info("No hay suficientes manzanas con dato de temperatura en el filtro actual.")
+
+# ─────────────────────────────────────────────────────────────
+# Análisis territorial: pérdida de vegetación vs. población
+# ─────────────────────────────────────────────────────────────
+
+st.subheader("¿Las manzanas más pobladas perdieron más vegetación (2020→2026)?")
+st.caption(
+    "Diferencia de NDVI promedio por manzana (Sentinel-2, 10m) vs. población. "
+    "Valores negativos de Δ NDVI indican pérdida de cobertura vegetal en el período."
+)
+
+datos_ndvi = manzanas_filtradas[(manzanas_filtradas["n_per"] > 0)].dropna(subset=["ndvi_diff_mean"])
+if len(datos_ndvi) > 5:
+    corr_ndvi = np.corrcoef(datos_ndvi["n_per"], datos_ndvi["ndvi_diff_mean"])[0, 1]
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.metric("Correlación", f"{corr_ndvi:.2f}")
+        st.caption("Negativo: más población = mayor pérdida de vegetación.\nCercano a 0: sin relación clara.")
+    with col2:
+        fig_ndvi = px.scatter(
+            datos_ndvi, x="n_per", y="ndvi_diff_mean",
+            labels={"n_per": "Población de la manzana", "ndvi_diff_mean": "Δ NDVI promedio 2020→2026"},
+            opacity=0.6,
+        )
+        fig_ndvi.add_hline(y=0, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig_ndvi, use_container_width=True)
+else:
+    st.info("Ajusta el filtro de población para incluir más manzanas y ver esta relación.")
+
+# ─────────────────────────────────────────────────────────────
 # Tabla de atributos
 # ─────────────────────────────────────────────────────────────
 
 st.subheader(f"Tabla de atributos — {capa_analisis}")
 if capa_analisis == "Manzanas censales":
-    cols = ["COMUNA", "n_per", "n_hog", "n_mujeres", "n_hombres", "prom_per_hog"]
+    cols = ["COMUNA", "n_per", "n_hog", "n_mujeres", "n_hombres", "prom_per_hog", "ndvi_diff_mean", "lst_mean"]
     st.dataframe(manzanas_filtradas[cols], use_container_width=True)
 elif capa_analisis == "Uso de suelo":
     st.dataframe(uso[["USO", "SUBUSO", "COBERTURA", "SUPERF_HA"]], use_container_width=True)
 else:
     st.dataframe(vial[["Nom_Ruta", "Clase_Ruta", "Catego", "shape_leng"]], use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────
+# Fuentes y metadatos
+# ─────────────────────────────────────────────────────────────
+
+with st.expander("📋 Fuentes y metadatos de las capas"):
+    st.markdown("""
+    | Capa | Fuente | Año / período | Resolución |
+    |---|---|---|---|
+    | Manzanas censales | INE, Censo de Población y Vivienda | 2024 | Polígono censal |
+    | Uso de suelo | CONAF, catastro de uso de suelo | 2024 | Polígono, escala catastro CONAF |
+    | Red vial | MOP, red vial nacional | 2019 | Línea |
+    | DEM (elevación) | OpenTopography (SRTM) | Misión 2000 | 30 m |
+    | NDVI 2020 / 2026 | Sentinel-2 SR (Copernicus), mediana anual jul-jul | jul2020-jul2021 y jul2025-jul2026 | 10 m |
+    | Δ NDVI 2020→2026 | Diferencia de los dos composites anteriores | 2020-2026 | 10 m |
+    | Temperatura superficial (LST) | Landsat 8/9 Collection 2 Level 2, banda térmica | ene2025-jul2026 | 30 m |
+
+    Las capas provienen de años distintos porque corresponden a los productos oficiales
+    más recientes disponibles en cada fuente al momento del análisis. La red vial (2019)
+    y el DEM (SRTM, 2000) se usan como referencia estructural de base y no como
+    insumo temporal del análisis de cambio, que se apoya en NDVI y LST (2020-2026).
+    """)
