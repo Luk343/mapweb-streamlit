@@ -3,7 +3,7 @@
 Aplicación web geoespacial construida con Python y Streamlit para el Trabajo Final
 de Aplicaciones SIG (ASIG2026, Escuela de Geografía UACh).
 
-**App en vivo:** https://super-mapweb-rbyq9amgn3qf6hx5vgmvpy.streamlit.app
+**App en vivo:** https://mapweb-app-bjsvjfdxofwehczrguh8me.streamlit.app/
 
 ## Pregunta territorial
 
