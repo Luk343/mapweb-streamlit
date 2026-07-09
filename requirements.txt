@@ -6,3 +6,4 @@ rasterio
 matplotlib
 numpy
 Pillow
+plotly
