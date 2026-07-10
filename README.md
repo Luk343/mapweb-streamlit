@@ -85,7 +85,7 @@ super-mapweb/
 ## Ejecutar localmente
 
 ```bash
-git clone https://github.com/Luk343/super-mapweb.git
+git clone https://github.com/Luk343/mapweb-streamlit.git
 cd super-mapweb
 pip install -r requirements.txt
 streamlit run app.py
